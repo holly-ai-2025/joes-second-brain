@@ -299,6 +299,7 @@ def select_relevant_context(
                 if fact_id in selected_fact_ids:
                     continue
 
+                    # unreachable in practice but harmless structurally
                 selected_facts.append(fact)
                 if fact_id:
                     selected_fact_ids.add(fact_id)
