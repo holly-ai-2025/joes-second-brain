@@ -277,14 +277,15 @@ def fetch_conversation_or_404(conversation_id: str):
 
 
 def normalize_message_for_routing(message: str) -> str:
-    """
-    Lowercase and normalize whitespace for deterministic routing checks.
-    """
     return " ".join(message.strip().lower().split())
 
 
 def contains_any_phrase(text: str, phrases: list[str]) -> bool:
     return any(phrase in text for phrase in phrases)
+
+
+def starts_with_any_phrase(text: str, prefixes: list[str]) -> bool:
+    return any(text.startswith(prefix) for prefix in prefixes)
 
 
 def is_task_query(text: str) -> bool:
@@ -294,12 +295,18 @@ def is_task_query(text: str) -> bool:
         "create a task",
         "create task",
         "new task",
+        "add this to my tasks",
+        "add that to my tasks",
+        "add this to my task list",
+        "add that to my task list",
         "put this on my task list",
         "put that on my task list",
         "put this on my list",
         "put that on my list",
-        "add this to my task list",
-        "add that to my task list",
+        "put this on my tasks",
+        "put that on my tasks",
+        "can you add a task",
+        "can you create a task",
     ]
 
     task_list_phrases = [
@@ -311,10 +318,15 @@ def is_task_query(text: str) -> bool:
         "what are my tasks",
         "what tasks do i have",
         "do i have any tasks",
+        "do i have tasks",
         "what is on my task list",
         "what's on my task list",
         "show me my task list",
         "show me my tasks",
+        "what is on my list",
+        "what's on my list",
+        "what do i have on my list",
+        "what do i have on my task list",
     ]
 
     return contains_any_phrase(text, task_create_phrases + task_list_phrases)
@@ -328,20 +340,27 @@ def is_memory_query(text: str) -> bool:
         "what did i mention",
         "what have we discussed",
         "what did we discuss",
-        "what do i know about",
-        "what do you know about",
-        "what do you remember about",
         "what have i said about",
         "what did i say about",
         "what did i mention about",
         "what have we discussed about",
         "what did we discuss about",
-        "remind me about",
+        "what do i know about",
+        "what do you know about",
+        "what do you remember about",
+        "what have you stored about",
+        "what have you got about",
+        "tell me what you know about",
         "tell me what you remember about",
         "tell me what i said about",
         "tell me what i mentioned about",
+        "remind me about",
+        "remind me what i said about",
+        "remind me what i mentioned about",
         "have i mentioned",
         "did i mention",
+        "have we discussed",
+        "did we discuss",
         "remember",
         "mentioned",
         "earlier",
@@ -356,7 +375,7 @@ def is_memory_query(text: str) -> bool:
     if contains_any_phrase(text, explicit_memory_phrases):
         return True
 
-    if any(text.startswith(prefix) for prefix in followup_memory_starts):
+    if starts_with_any_phrase(text, followup_memory_starts):
         return True
 
     return False
@@ -373,9 +392,12 @@ def route_message_decision(message: str, conversation_id: str | None = None) -> 
         "in our current conversation",
         "from this conversation",
         "from this chat",
+        "in this thread",
+        "from this thread",
     ]
 
     if is_task_query(text):
+        logger.info("Routing decision: task | message=%s", text)
         return {
             "route": "task",
             "reason": "Matched task phrase"
@@ -383,10 +405,12 @@ def route_message_decision(message: str, conversation_id: str | None = None) -> 
 
     if contains_any_phrase(text, local_memory_phrases):
         if conversation_id:
+            logger.info("Routing decision: conversation_memory | message=%s", text)
             return {
                 "route": "conversation_memory",
                 "reason": "Matched current-conversation memory phrase and conversation_id was provided"
             }
+        logger.info("Routing decision: global_memory | message=%s", text)
         return {
             "route": "global_memory",
             "reason": "Matched current-conversation memory phrase but no conversation_id was provided"
@@ -394,15 +418,18 @@ def route_message_decision(message: str, conversation_id: str | None = None) -> 
 
     if is_memory_query(text):
         if conversation_id:
+            logger.info("Routing decision: conversation_memory | message=%s", text)
             return {
                 "route": "conversation_memory",
                 "reason": "Matched memory phrase and conversation_id was provided"
             }
+        logger.info("Routing decision: global_memory | message=%s", text)
         return {
             "route": "global_memory",
             "reason": "Matched memory phrase with no conversation_id provided"
         }
 
+    logger.info("Routing decision: normal_chat | message=%s", text)
     return {
         "route": "normal_chat",
         "reason": "No task or memory phrase matched"
