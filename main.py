@@ -175,6 +175,26 @@ class ContextPackResponse(BaseModel):
     counts: dict
 
 
+class RouteClassificationOutput(BaseModel):
+    route: str
+    reason: str
+
+
+class FactCandidate(BaseModel):
+    fact_text: str = Field(..., min_length=1)
+    fact_type: str | None = None
+    confidence: float | None = None
+    subject: str | None = None
+    predicate: str | None = None
+    object: str | None = None
+
+
+class MemoryCaptureOutput(BaseModel):
+    topic: str | None = None
+    summary: str | None = None
+    facts: list[FactCandidate] = Field(default_factory=list)
+
+
 TOOLS = [
     {
         "type": "function",
@@ -206,6 +226,19 @@ TOOLS = [
         }
     }
 ]
+
+
+ALLOWED_ROUTES = {
+    "task",
+    "conversation_memory",
+    "global_memory",
+    "normal_chat",
+}
+
+AUTO_CAPTURE_ROUTES = {
+    "task",
+    "normal_chat",
+}
 
 
 def run_add_task(args: dict):
@@ -288,7 +321,7 @@ def starts_with_any_phrase(text: str, prefixes: list[str]) -> bool:
     return any(text.startswith(prefix) for prefix in prefixes)
 
 
-def is_task_query(text: str) -> bool:
+def is_high_confidence_task_query(text: str) -> bool:
     task_create_phrases = [
         "add a task",
         "add task",
@@ -332,14 +365,23 @@ def is_task_query(text: str) -> bool:
     return contains_any_phrase(text, task_create_phrases + task_list_phrases)
 
 
-def is_memory_query(text: str) -> bool:
+def get_high_confidence_memory_route(
+    text: str,
+    conversation_id: str | None = None
+) -> dict | None:
+    local_memory_phrases = [
+        "in this conversation",
+        "in this chat",
+        "earlier in this chat",
+        "earlier in this conversation",
+        "in our current conversation",
+        "from this conversation",
+        "from this chat",
+        "in this thread",
+        "from this thread",
+    ]
+
     explicit_memory_phrases = [
-        "what have i said",
-        "what did i say",
-        "what did we say",
-        "what did i mention",
-        "what have we discussed",
-        "what did we discuss",
         "what have i said about",
         "what did i say about",
         "what did i mention about",
@@ -361,10 +403,6 @@ def is_memory_query(text: str) -> bool:
         "did i mention",
         "have we discussed",
         "did we discuss",
-        "remember",
-        "mentioned",
-        "earlier",
-        "before",
     ]
 
     followup_memory_starts = [
@@ -372,67 +410,344 @@ def is_memory_query(text: str) -> bool:
         "and what about ",
     ]
 
+    if contains_any_phrase(text, local_memory_phrases):
+        if conversation_id:
+            return {
+                "route": "conversation_memory",
+                "reason": "Matched explicit current-conversation memory phrase"
+            }
+        return {
+            "route": "global_memory",
+            "reason": "Matched explicit current-conversation memory phrase but no conversation_id was provided"
+        }
+
     if contains_any_phrase(text, explicit_memory_phrases):
-        return True
+        if conversation_id:
+            return {
+                "route": "conversation_memory",
+                "reason": "Matched explicit memory lookup phrase and conversation_id was provided"
+            }
+        return {
+            "route": "global_memory",
+            "reason": "Matched explicit memory lookup phrase with no conversation_id provided"
+        }
 
     if starts_with_any_phrase(text, followup_memory_starts):
-        return True
+        if conversation_id:
+            return {
+                "route": "conversation_memory",
+                "reason": "Matched follow-up memory lookup phrase and conversation_id was provided"
+            }
+        return {
+            "route": "global_memory",
+            "reason": "Matched follow-up memory lookup phrase with no conversation_id provided"
+        }
 
-    return False
+    return None
+
+
+def classify_intent_route(message: str, conversation_id: str | None = None) -> dict:
+    system_prompt = (
+        "You are a strict backend route classifier for an AI companion system. "
+        "Classify the user's message into exactly one of these routes: "
+        "task, conversation_memory, global_memory, normal_chat. "
+        "Return JSON only with keys route and reason. "
+        "Do not include markdown, extra text, or code fences. "
+        "Use these rules: "
+        "task = the user is asking to add, create, or list tasks. "
+        "conversation_memory = the user is asking about something said, stored, or discussed in the current conversation and a conversation_id is available. "
+        "global_memory = the user is asking what is known, remembered, or stored across memory more generally, or conversation memory was requested but no conversation_id is available. "
+        "normal_chat = everything else. "
+        "Be conservative. "
+        "If the message is ordinary conversation and not clearly a task or memory lookup, choose normal_chat."
+    )
+
+    user_prompt = json.dumps(
+        {
+            "message": message,
+            "conversation_id_provided": bool(conversation_id),
+            "allowed_routes": sorted(ALLOWED_ROUTES),
+        }
+    )
+
+    response = client.responses.create(
+        model="gpt-5",
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ]
+    )
+
+    raw_output = response.output_text.strip()
+    logger.info("Classifier raw output: %s", raw_output)
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Classifier returned invalid JSON: {raw_output}") from e
+
+    validated = RouteClassificationOutput(**parsed)
+
+    if validated.route not in ALLOWED_ROUTES:
+        raise ValueError(f"Classifier returned invalid route: {validated.route}")
+
+    return {
+        "route": validated.route,
+        "reason": validated.reason
+    }
 
 
 def route_message_decision(message: str, conversation_id: str | None = None) -> dict:
     text = normalize_message_for_routing(message)
 
-    local_memory_phrases = [
-        "in this conversation",
-        "in this chat",
-        "earlier in this chat",
-        "earlier in this conversation",
-        "in our current conversation",
-        "from this conversation",
-        "from this chat",
-        "in this thread",
-        "from this thread",
-    ]
-
-    if is_task_query(text):
-        logger.info("Routing decision: task | message=%s", text)
+    if is_high_confidence_task_query(text):
+        logger.info("Routing decision: task | source=rule | message=%s", text)
         return {
             "route": "task",
-            "reason": "Matched task phrase"
+            "reason": "Matched high-confidence task phrase",
+            "decision_source": "rule"
         }
 
-    if contains_any_phrase(text, local_memory_phrases):
-        if conversation_id:
-            logger.info("Routing decision: conversation_memory | message=%s", text)
-            return {
-                "route": "conversation_memory",
-                "reason": "Matched current-conversation memory phrase and conversation_id was provided"
-            }
-        logger.info("Routing decision: global_memory | message=%s", text)
+    memory_rule_result = get_high_confidence_memory_route(
+        text=text,
+        conversation_id=conversation_id
+    )
+    if memory_rule_result:
+        logger.info(
+            "Routing decision: %s | source=rule | message=%s",
+            memory_rule_result["route"],
+            text
+        )
         return {
-            "route": "global_memory",
-            "reason": "Matched current-conversation memory phrase but no conversation_id was provided"
+            "route": memory_rule_result["route"],
+            "reason": memory_rule_result["reason"],
+            "decision_source": "rule"
         }
 
-    if is_memory_query(text):
-        if conversation_id:
-            logger.info("Routing decision: conversation_memory | message=%s", text)
-            return {
-                "route": "conversation_memory",
-                "reason": "Matched memory phrase and conversation_id was provided"
-            }
-        logger.info("Routing decision: global_memory | message=%s", text)
-        return {
-            "route": "global_memory",
-            "reason": "Matched memory phrase with no conversation_id provided"
-        }
-
-    logger.info("Routing decision: normal_chat | message=%s", text)
+    classifier_result = classify_intent_route(
+        message=message.strip(),
+        conversation_id=conversation_id
+    )
+    logger.info(
+        "Routing decision: %s | source=classifier | message=%s",
+        classifier_result["route"],
+        text
+    )
     return {
-        "route": "normal_chat",
-        "reason": "No task or memory phrase matched"
+        "route": classifier_result["route"],
+        "reason": classifier_result["reason"],
+        "decision_source": "classifier"
+    }
+
+
+def get_next_segment_index(conversation_id: str) -> int:
+    result = (
+        supabase.table("conversation_segments")
+        .select("segment_index")
+        .eq("conversation_id", conversation_id)
+        .order("segment_index", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    rows = result.data or []
+    if not rows:
+        return 1
+
+    return int(rows[0]["segment_index"]) + 1
+
+
+def should_auto_capture_memory(route: str) -> bool:
+    return route in AUTO_CAPTURE_ROUTES
+
+
+def extract_memory_capture(
+    user_message: str,
+    assistant_reply: str,
+    route: str
+) -> MemoryCaptureOutput:
+    system_prompt = (
+        "You are a strict structured-memory extraction helper for an AI companion backend. "
+        "Your job is to extract conservative, durable memory candidates from a single user-assistant exchange. "
+        "Return JSON only with keys: topic, summary, facts. "
+        "facts must be a list of objects with keys: fact_text, fact_type, confidence, subject, predicate, object. "
+        "Do not include markdown or any extra text. "
+        "Be conservative. "
+        "Only extract facts that are grounded in the user's message, not invented by the assistant. "
+        "Prefer durable or meaningful information such as preferences, plans, relationships, project details, persistent circumstances, or notable user-provided facts. "
+        "Do not store generic chit-chat, assistant advice, filler, or very temporary emotions. "
+        "If the route is task, do not store the task itself unless the user message also contains a meaningful non-task fact worth remembering. "
+        "You may return zero facts. "
+        "Keep topic and summary short and factual. "
+        "Use plain ASCII only."
+    )
+
+    user_prompt = json.dumps(
+        {
+            "route": route,
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+        }
+    )
+
+    response = client.responses.create(
+        model="gpt-5",
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ]
+    )
+
+    raw_output = response.output_text.strip()
+    logger.info("Memory capture raw output: %s", raw_output)
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Memory extractor returned invalid JSON: {raw_output}") from e
+
+    validated = MemoryCaptureOutput(**parsed)
+
+    trimmed_facts = []
+    for fact in validated.facts[:3]:
+        confidence = fact.confidence
+        if confidence is not None:
+            confidence = max(0.0, min(1.0, confidence))
+
+        trimmed_facts.append(
+            FactCandidate(
+                fact_text=fact.fact_text.strip(),
+                fact_type=(fact.fact_type.strip() if fact.fact_type else None),
+                confidence=confidence,
+                subject=(fact.subject.strip() if fact.subject else None),
+                predicate=(fact.predicate.strip() if fact.predicate else None),
+                object=(fact.object.strip() if fact.object else None),
+            )
+        )
+
+    return MemoryCaptureOutput(
+        topic=validated.topic.strip() if validated.topic else None,
+        summary=validated.summary.strip() if validated.summary else None,
+        facts=trimmed_facts,
+    )
+
+
+def auto_capture_exchange_memory(
+    conversation_id: str | None,
+    user_message: str,
+    assistant_reply: str,
+    route: str,
+    decision_source: str
+) -> dict:
+    if not should_auto_capture_memory(route):
+        return {
+            "status": "skipped",
+            "reason": f"Route '{route}' is not eligible for auto memory capture"
+        }
+
+    if not conversation_id:
+        return {
+            "status": "skipped",
+            "reason": "No conversation_id was provided"
+        }
+
+    fetch_conversation_or_404(conversation_id)
+
+    extraction = None
+    extraction_error = None
+
+    try:
+        extraction = extract_memory_capture(
+            user_message=user_message,
+            assistant_reply=assistant_reply,
+            route=route
+        )
+    except Exception as e:
+        extraction_error = str(e)
+        logger.exception("Memory extraction failed; continuing with bare segment storage")
+
+    segment_index = get_next_segment_index(conversation_id)
+
+    segment_payload = {
+        "conversation_id": conversation_id,
+        "segment_index": segment_index,
+        "topic": extraction.topic if extraction else None,
+        "summary": extraction.summary if extraction else None,
+        "raw_user_text": user_message,
+        "raw_assistant_text": assistant_reply,
+        "metadata": {
+            "source": "auto_capture",
+            "route": route,
+            "decision_source": decision_source,
+            "extraction_status": "ok" if extraction else "failed",
+            "extraction_error": extraction_error,
+        }
+    }
+
+    segment_result = supabase.table("conversation_segments").insert(segment_payload).execute()
+    segment = segment_result.data[0]
+    segment_id = segment["id"]
+
+    facts_created = 0
+    memories_created = 0
+
+    facts_to_store = extraction.facts if extraction else []
+
+    for fact in facts_to_store:
+        fact_result = supabase.table("memory_facts").insert({
+            "conversation_id": conversation_id,
+            "segment_id": segment_id,
+            "fact_text": fact.fact_text,
+            "fact_type": fact.fact_type or "user_fact",
+            "confidence": fact.confidence,
+            "subject": fact.subject,
+            "predicate": fact.predicate,
+            "object": fact.object,
+            "metadata": {
+                "source": "auto_capture",
+                "route": route,
+            }
+        }).execute()
+
+        fact_row = fact_result.data[0]
+        facts_created += 1
+
+        supabase.table("memories").insert({
+            "conversation_id": conversation_id,
+            "segment_id": segment_id,
+            "fact_id": fact_row["id"],
+            "memory_kind": "semantic_scaffold",
+            "content": fact.fact_text,
+            "status": "active",
+            "metadata": {
+                "source": "auto_capture",
+                "route": route,
+            }
+        }).execute()
+
+        memories_created += 1
+
+    return {
+        "status": "stored",
+        "reason": "Auto memory capture completed",
+        "segment_id": segment_id,
+        "segment_index": segment_index,
+        "facts_created": facts_created,
+        "memories_created": memories_created,
+        "extraction_status": "ok" if extraction else "failed",
+        "extraction_error": extraction_error,
     }
 
 
@@ -846,7 +1161,8 @@ def route_message(input_data: RouteDecisionInput):
             "message": input_data.message,
             "conversation_id": input_data.conversation_id,
             "route": decision["route"],
-            "reason": decision["reason"]
+            "reason": decision["reason"],
+            "decision_source": decision["decision_source"]
         }
 
     except ValidationError as e:
@@ -1053,13 +1369,25 @@ def companion(input_data: CompanionInput):
 
         route = decision["route"]
         reason = decision["reason"]
+        decision_source = decision["decision_source"]
 
         if route == "task":
             result = run_task_agent_flow(user_message)
+
+            memory_capture = auto_capture_exchange_memory(
+                conversation_id=conversation_id,
+                user_message=user_message,
+                assistant_reply=result["reply"],
+                route=route,
+                decision_source=decision_source
+            )
+
             return {
                 "route_used": route,
                 "reason": reason,
-                "reply": result["reply"]
+                "decision_source": decision_source,
+                "reply": result["reply"],
+                "memory_capture": memory_capture
             }
 
         if route == "conversation_memory":
@@ -1067,15 +1395,25 @@ def companion(input_data: CompanionInput):
                 return {
                     "route_used": route,
                     "reason": "Conversation memory route selected but no conversation_id was provided",
-                    "reply": "A conversation_id is required for current-conversation memory."
+                    "decision_source": decision_source,
+                    "reply": "A conversation_id is required for current-conversation memory.",
+                    "memory_capture": {
+                        "status": "skipped",
+                        "reason": "Route 'conversation_memory' is not eligible for auto memory capture"
+                    }
                 }
 
             result = run_conversation_memory_flow(user_message, conversation_id)
             return {
                 "route_used": route,
                 "reason": reason,
+                "decision_source": decision_source,
                 "reply": result["reply"],
-                "context_used": result["context_used"]
+                "context_used": result["context_used"],
+                "memory_capture": {
+                    "status": "skipped",
+                    "reason": "Route 'conversation_memory' is not eligible for auto memory capture"
+                }
             }
 
         if route == "global_memory":
@@ -1083,15 +1421,31 @@ def companion(input_data: CompanionInput):
             return {
                 "route_used": route,
                 "reason": reason,
+                "decision_source": decision_source,
                 "reply": result["reply"],
-                "context_used": result["context_used"]
+                "context_used": result["context_used"],
+                "memory_capture": {
+                    "status": "skipped",
+                    "reason": "Route 'global_memory' is not eligible for auto memory capture"
+                }
             }
 
         result = run_normal_chat_flow(user_message)
+
+        memory_capture = auto_capture_exchange_memory(
+            conversation_id=conversation_id,
+            user_message=user_message,
+            assistant_reply=result["reply"],
+            route=route,
+            decision_source=decision_source
+        )
+
         return {
             "route_used": route,
             "reason": reason,
-            "reply": result["reply"]
+            "decision_source": decision_source,
+            "reply": result["reply"],
+            "memory_capture": memory_capture
         }
 
     except ValueError as e:
