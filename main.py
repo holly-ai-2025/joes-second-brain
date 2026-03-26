@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ValidationError, Field
 from dotenv import load_dotenv
@@ -30,6 +31,161 @@ if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+FACT_TYPE_VALUES = {
+    "plan",
+    "possibility",
+    "preference",
+    "decision",
+    "status",
+    "relationship",
+    "fact",
+}
+
+UNCERTAINTY_WORDS = {
+    "might",
+    "maybe",
+    "may",
+    "possibly",
+    "perhaps",
+    "could",
+    "unclear",
+    "unsure",
+    "not sure",
+    "probably",
+    "likely",
+}
+
+STRONG_COMMITMENT_WORDS = {
+    "will",
+    "definitely",
+    "decided",
+    "i decided",
+    "have decided",
+    "committed",
+    "confirmed",
+    "i am going to",
+    "i'm going to",
+}
+
+MODERATE_COMMITMENT_WORDS = {
+    "plan",
+    "planning",
+    "intend",
+    "intending",
+    "going to",
+}
+
+PREFERENCE_WORDS = {
+    "prefer",
+    "like",
+    "love",
+    "hate",
+    "dislike",
+    "want",
+    "would rather",
+}
+
+STATUS_WORDS = {
+    "am",
+    "i am",
+    "i'm",
+    "currently",
+    "working on",
+    "live",
+    "living",
+    "have",
+    "has",
+    "is",
+    "are",
+}
+
+RELATIONSHIP_WORDS = {
+    "friend",
+    "sister",
+    "brother",
+    "mum",
+    "mom",
+    "mother",
+    "dad",
+    "father",
+    "partner",
+    "husband",
+    "wife",
+    "colleague",
+    "teammate",
+    "manager",
+    "client",
+}
+
+PROJECT_KEYWORDS = {
+    "project",
+    "backend",
+    "frontend",
+    "app",
+    "build",
+    "system",
+    "architecture",
+    "memory",
+    "routing",
+    "task",
+    "tasks",
+    "companion",
+    "gpt",
+    "openai",
+    "supabase",
+    "render",
+    "api",
+    "voice",
+    "whisper",
+    "phase",
+}
+
+FUTURE_WORDS = {
+    "next",
+    "tomorrow",
+    "weekend",
+    "later",
+    "soon",
+    "future",
+    "month",
+    "months",
+    "week",
+    "weeks",
+    "plan",
+    "planning",
+    "going to",
+    "will",
+    "might",
+    "may",
+}
+
+DECISION_WORDS = {
+    "decided",
+    "decision",
+    "choose",
+    "chose",
+    "chosen",
+    "going with",
+    "settled on",
+    "committed to",
+}
+
+PRONOUN_LIKE_NAMES = {
+    "I",
+    "I'm",
+    "Ive",
+    "I've",
+    "It",
+    "This",
+    "That",
+    "We",
+    "You",
+    "He",
+    "She",
+    "They",
+}
 
 
 class MessageInput(BaseModel):
@@ -321,6 +477,131 @@ def starts_with_any_phrase(text: str, prefixes: list[str]) -> bool:
     return any(text.startswith(prefix) for prefix in prefixes)
 
 
+def normalize_fact_type(raw_fact_type: str | None, fact_text: str) -> str:
+    fact_type = (raw_fact_type or "").strip().lower()
+    text = normalize_message_for_routing(fact_text)
+
+    if fact_type in FACT_TYPE_VALUES:
+        return fact_type
+
+    if contains_any_phrase(text, list(PREFERENCE_WORDS)):
+        return "preference"
+
+    if contains_any_phrase(text, list(DECISION_WORDS)):
+        return "decision"
+
+    if contains_any_phrase(text, list(UNCERTAINTY_WORDS)):
+        return "possibility"
+
+    if contains_any_phrase(text, list(MODERATE_COMMITMENT_WORDS | STRONG_COMMITMENT_WORDS | FUTURE_WORDS)):
+        return "plan"
+
+    if contains_any_phrase(text, list(RELATIONSHIP_WORDS)):
+        return "relationship"
+
+    if contains_any_phrase(text, list(STATUS_WORDS)):
+        return "status"
+
+    return "fact"
+
+
+def score_confidence_for_fact(fact_text: str, fact_type: str, extracted_confidence: float | None) -> float:
+    text = normalize_message_for_routing(fact_text)
+
+    if contains_any_phrase(text, list(UNCERTAINTY_WORDS)):
+        base = 0.5
+    elif contains_any_phrase(text, list(STRONG_COMMITMENT_WORDS | DECISION_WORDS)):
+        base = 0.9
+    elif contains_any_phrase(text, list(MODERATE_COMMITMENT_WORDS)):
+        base = 0.75
+    elif fact_type in {"preference", "relationship", "status"}:
+        base = 0.85
+    else:
+        base = 0.7
+
+    if extracted_confidence is None:
+        return base
+
+    bounded_extracted = max(0.0, min(1.0, extracted_confidence))
+    final_score = (base * 0.7) + (bounded_extracted * 0.3)
+    return round(max(0.0, min(1.0, final_score)), 2)
+
+
+def detect_named_person_signal(fact_text: str, subject: str | None, object_value: str | None) -> bool:
+    for candidate in [subject, object_value]:
+        if candidate and candidate.strip():
+            cleaned = candidate.strip()
+            if cleaned[:1].isupper() and cleaned not in PRONOUN_LIKE_NAMES:
+                return True
+
+    matches = re.findall(r"\b[A-Z][a-z]+\b", fact_text)
+    filtered = [m for m in matches if m not in PRONOUN_LIKE_NAMES]
+    return len(filtered) > 0
+
+
+def score_importance_for_fact(
+    fact_text: str,
+    fact_type: str,
+    subject: str | None,
+    predicate: str | None,
+    object_value: str | None
+) -> tuple[float, list[str]]:
+    text = normalize_message_for_routing(fact_text)
+    score = 0.5
+    signals = []
+
+    if detect_named_person_signal(fact_text, subject, object_value):
+        score += 0.2
+        signals.append("person")
+
+    if contains_any_phrase(text, list(FUTURE_WORDS)) or fact_type in {"plan", "possibility", "decision"}:
+        score += 0.2
+        signals.append("future")
+
+    if contains_any_phrase(text, list(PROJECT_KEYWORDS)):
+        score += 0.1
+        signals.append("project")
+
+    if fact_type in {"preference", "decision", "relationship"}:
+        score += 0.1
+        signals.append(f"type:{fact_type}")
+
+    return round(min(score, 1.0), 2), signals
+
+
+def enrich_fact_candidate(fact: FactCandidate) -> tuple[FactCandidate, dict]:
+    clean_fact_text = fact.fact_text.strip()
+    normalized_fact_type = normalize_fact_type(fact.fact_type, clean_fact_text)
+    normalized_confidence = score_confidence_for_fact(
+        fact_text=clean_fact_text,
+        fact_type=normalized_fact_type,
+        extracted_confidence=fact.confidence
+    )
+    importance, signals = score_importance_for_fact(
+        fact_text=clean_fact_text,
+        fact_type=normalized_fact_type,
+        subject=fact.subject,
+        predicate=fact.predicate,
+        object_value=fact.object
+    )
+
+    enriched_fact = FactCandidate(
+        fact_text=clean_fact_text,
+        fact_type=normalized_fact_type,
+        confidence=normalized_confidence,
+        subject=(fact.subject.strip() if fact.subject else None),
+        predicate=(fact.predicate.strip() if fact.predicate else None),
+        object=(fact.object.strip() if fact.object else None),
+    )
+
+    metadata = {
+        "importance": importance,
+        "signals": signals,
+    }
+
+    return enriched_fact, metadata
+
+
 def is_high_confidence_task_query(text: str) -> bool:
     task_create_phrases = [
         "add a task",
@@ -577,6 +858,7 @@ def extract_memory_capture(
         "Your job is to extract conservative, durable memory candidates from a single user-assistant exchange. "
         "Return JSON only with keys: topic, summary, facts. "
         "facts must be a list of objects with keys: fact_text, fact_type, confidence, subject, predicate, object. "
+        "Use fact_type conservatively from this preferred set when possible: plan, possibility, preference, decision, status, relationship, fact. "
         "Do not include markdown or any extra text. "
         "Be conservative. "
         "Only extract facts that are grounded in the user's message, not invented by the assistant. "
@@ -622,20 +904,21 @@ def extract_memory_capture(
 
     trimmed_facts = []
     for fact in validated.facts[:3]:
-        confidence = fact.confidence
-        if confidence is not None:
-            confidence = max(0.0, min(1.0, confidence))
+        clean_fact_text = fact.fact_text.strip()
+        if not clean_fact_text:
+            continue
 
-        trimmed_facts.append(
-            FactCandidate(
-                fact_text=fact.fact_text.strip(),
-                fact_type=(fact.fact_type.strip() if fact.fact_type else None),
-                confidence=confidence,
-                subject=(fact.subject.strip() if fact.subject else None),
-                predicate=(fact.predicate.strip() if fact.predicate else None),
-                object=(fact.object.strip() if fact.object else None),
-            )
+        preliminary_fact = FactCandidate(
+            fact_text=clean_fact_text,
+            fact_type=(fact.fact_type.strip() if fact.fact_type else None),
+            confidence=fact.confidence,
+            subject=(fact.subject.strip() if fact.subject else None),
+            predicate=(fact.predicate.strip() if fact.predicate else None),
+            object=(fact.object.strip() if fact.object else None),
         )
+
+        enriched_fact, _ = enrich_fact_candidate(preliminary_fact)
+        trimmed_facts.append(enriched_fact)
 
     return MemoryCaptureOutput(
         topic=validated.topic.strip() if validated.topic else None,
@@ -706,18 +989,22 @@ def auto_capture_exchange_memory(
     facts_to_store = extraction.facts if extraction else []
 
     for fact in facts_to_store:
+        enriched_fact, enrichment_metadata = enrich_fact_candidate(fact)
+
         fact_result = supabase.table("memory_facts").insert({
             "conversation_id": conversation_id,
             "segment_id": segment_id,
-            "fact_text": fact.fact_text,
-            "fact_type": fact.fact_type or "user_fact",
-            "confidence": fact.confidence,
-            "subject": fact.subject,
-            "predicate": fact.predicate,
-            "object": fact.object,
+            "fact_text": enriched_fact.fact_text,
+            "fact_type": enriched_fact.fact_type or "fact",
+            "confidence": enriched_fact.confidence,
+            "subject": enriched_fact.subject,
+            "predicate": enriched_fact.predicate,
+            "object": enriched_fact.object,
             "metadata": {
                 "source": "auto_capture",
                 "route": route,
+                "importance": enrichment_metadata["importance"],
+                "signals": enrichment_metadata["signals"],
             }
         }).execute()
 
@@ -729,11 +1016,12 @@ def auto_capture_exchange_memory(
             "segment_id": segment_id,
             "fact_id": fact_row["id"],
             "memory_kind": "semantic_scaffold",
-            "content": fact.fact_text,
+            "content": enriched_fact.fact_text,
             "status": "active",
             "metadata": {
                 "source": "auto_capture",
                 "route": route,
+                "importance": enrichment_metadata["importance"],
             }
         }).execute()
 
