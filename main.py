@@ -137,28 +137,28 @@ PROJECT_KEYWORDS = {
     "supabase",
     "render",
     "api",
-    "voice",
     "whisper",
     "phase",
+    "model",
+    "model-agnostic",
 }
 
-FUTURE_WORDS = {
-    "next",
+FUTURE_PHRASES = {
+    "next week",
+    "next weekend",
+    "next month",
+    "next year",
     "tomorrow",
-    "weekend",
+    "this weekend",
     "later",
     "soon",
-    "future",
-    "month",
-    "months",
-    "week",
-    "weeks",
-    "plan",
-    "planning",
     "going to",
     "will",
     "might",
     "may",
+    "plan to",
+    "plans to",
+    "planning to",
 }
 
 DECISION_WORDS = {
@@ -170,6 +170,25 @@ DECISION_WORDS = {
     "going with",
     "settled on",
     "committed to",
+}
+
+NON_PERSON_ENTITIES = {
+    "user",
+    "the user",
+    "friend",
+    "friends",
+    "frontend",
+    "backend",
+    "london",
+    "render",
+    "gpt",
+    "openai",
+    "supabase",
+    "api",
+    "task",
+    "tasks",
+    "voice interaction",
+    "typing",
 }
 
 PRONOUN_LIKE_NAMES = {
@@ -185,6 +204,7 @@ PRONOUN_LIKE_NAMES = {
     "He",
     "She",
     "They",
+    "The",
 }
 
 
@@ -469,7 +489,7 @@ def normalize_message_for_routing(message: str) -> str:
     return " ".join(message.strip().lower().split())
 
 
-def contains_any_phrase(text: str, phrases: list[str]) -> bool:
+def contains_any_phrase(text: str, phrases: list[str] | set[str]) -> bool:
     return any(phrase in text for phrase in phrases)
 
 
@@ -484,22 +504,22 @@ def normalize_fact_type(raw_fact_type: str | None, fact_text: str) -> str:
     if fact_type in FACT_TYPE_VALUES:
         return fact_type
 
-    if contains_any_phrase(text, list(PREFERENCE_WORDS)):
+    if contains_any_phrase(text, PREFERENCE_WORDS):
         return "preference"
 
-    if contains_any_phrase(text, list(DECISION_WORDS)):
+    if contains_any_phrase(text, DECISION_WORDS):
         return "decision"
 
-    if contains_any_phrase(text, list(UNCERTAINTY_WORDS)):
+    if contains_any_phrase(text, UNCERTAINTY_WORDS):
         return "possibility"
 
-    if contains_any_phrase(text, list(MODERATE_COMMITMENT_WORDS | STRONG_COMMITMENT_WORDS | FUTURE_WORDS)):
+    if contains_any_phrase(text, MODERATE_COMMITMENT_WORDS | STRONG_COMMITMENT_WORDS | FUTURE_PHRASES):
         return "plan"
 
-    if contains_any_phrase(text, list(RELATIONSHIP_WORDS)):
+    if contains_any_phrase(text, RELATIONSHIP_WORDS):
         return "relationship"
 
-    if contains_any_phrase(text, list(STATUS_WORDS)):
+    if contains_any_phrase(text, STATUS_WORDS):
         return "status"
 
     return "fact"
@@ -508,11 +528,11 @@ def normalize_fact_type(raw_fact_type: str | None, fact_text: str) -> str:
 def score_confidence_for_fact(fact_text: str, fact_type: str, extracted_confidence: float | None) -> float:
     text = normalize_message_for_routing(fact_text)
 
-    if contains_any_phrase(text, list(UNCERTAINTY_WORDS)):
+    if contains_any_phrase(text, UNCERTAINTY_WORDS):
         base = 0.5
-    elif contains_any_phrase(text, list(STRONG_COMMITMENT_WORDS | DECISION_WORDS)):
+    elif contains_any_phrase(text, STRONG_COMMITMENT_WORDS | DECISION_WORDS):
         base = 0.9
-    elif contains_any_phrase(text, list(MODERATE_COMMITMENT_WORDS)):
+    elif contains_any_phrase(text, MODERATE_COMMITMENT_WORDS):
         base = 0.75
     elif fact_type in {"preference", "relationship", "status"}:
         base = 0.85
@@ -520,23 +540,60 @@ def score_confidence_for_fact(fact_text: str, fact_type: str, extracted_confiden
         base = 0.7
 
     if extracted_confidence is None:
-        return base
+        return round(base, 2)
 
     bounded_extracted = max(0.0, min(1.0, extracted_confidence))
     final_score = (base * 0.7) + (bounded_extracted * 0.3)
     return round(max(0.0, min(1.0, final_score)), 2)
 
 
-def detect_named_person_signal(fact_text: str, subject: str | None, object_value: str | None) -> bool:
-    for candidate in [subject, object_value]:
-        if candidate and candidate.strip():
-            cleaned = candidate.strip()
-            if cleaned[:1].isupper() and cleaned not in PRONOUN_LIKE_NAMES:
-                return True
+def is_likely_named_person(candidate: str | None) -> bool:
+    if not candidate:
+        return False
 
-    matches = re.findall(r"\b[A-Z][a-z]+\b", fact_text)
-    filtered = [m for m in matches if m not in PRONOUN_LIKE_NAMES]
-    return len(filtered) > 0
+    cleaned = candidate.strip()
+    cleaned_lower = cleaned.lower()
+
+    if not cleaned or cleaned_lower in NON_PERSON_ENTITIES:
+        return False
+
+    if cleaned in PRONOUN_LIKE_NAMES:
+        return False
+
+    if re.search(r"\b(next|weekend|week|month|year|tomorrow|later|soon)\b", cleaned_lower):
+        return False
+
+    if cleaned_lower in PROJECT_KEYWORDS:
+        return False
+
+    return bool(re.fullmatch(r"[A-Z][a-z]+(?: [A-Z][a-z]+)?", cleaned))
+
+
+def detect_named_person_signal(fact_text: str, subject: str | None, object_value: str | None) -> bool:
+    if is_likely_named_person(subject):
+        return True
+
+    if is_likely_named_person(object_value):
+        return True
+
+    return False
+
+
+def detect_future_signal(fact_text: str) -> bool:
+    text = normalize_message_for_routing(fact_text)
+    return contains_any_phrase(text, FUTURE_PHRASES)
+
+
+def detect_project_signal(fact_text: str, predicate: str | None, object_value: str | None) -> bool:
+    combined = " ".join(
+        [
+            normalize_message_for_routing(fact_text),
+            normalize_message_for_routing(predicate or ""),
+            normalize_message_for_routing(object_value or ""),
+        ]
+    ).strip()
+
+    return contains_any_phrase(combined, PROJECT_KEYWORDS)
 
 
 def score_importance_for_fact(
@@ -546,7 +603,6 @@ def score_importance_for_fact(
     predicate: str | None,
     object_value: str | None
 ) -> tuple[float, list[str]]:
-    text = normalize_message_for_routing(fact_text)
     score = 0.5
     signals = []
 
@@ -554,11 +610,11 @@ def score_importance_for_fact(
         score += 0.2
         signals.append("person")
 
-    if contains_any_phrase(text, list(FUTURE_WORDS)) or fact_type in {"plan", "possibility", "decision"}:
+    if detect_future_signal(fact_text) or fact_type in {"plan", "possibility", "decision"}:
         score += 0.2
         signals.append("future")
 
-    if contains_any_phrase(text, list(PROJECT_KEYWORDS)):
+    if detect_project_signal(fact_text, predicate, object_value):
         score += 0.1
         signals.append("project")
 
