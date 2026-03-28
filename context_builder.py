@@ -168,6 +168,233 @@ def _dedupe_rows_by_id(rows: list[dict]) -> list[dict]:
     return deduped
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_unit_score(value: Any) -> float:
+    """
+    Normalize a score-like value to the range 0.0 -> 1.0 where possible.
+
+    Supported examples:
+    - 0.8 -> 0.8
+    - 80 -> 0.8
+    - "0.8" -> 0.8
+    - None / invalid -> 0.0
+    """
+    numeric = _safe_float(value, default=0.0)
+
+    if numeric <= 0:
+        return 0.0
+    if numeric <= 1:
+        return numeric
+    if numeric <= 100:
+        return numeric / 100.0
+    return 1.0
+
+
+def _normalize_importance_score(value: Any) -> float:
+    """
+    Normalize importance into a simple deterministic 0.0 -> 1.0 score.
+
+    Supported examples:
+    - low / medium / high
+    - 0.0 -> 1.0
+    - 0 -> 100
+    """
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        mapping = {
+            "low": 0.25,
+            "medium": 0.5,
+            "med": 0.5,
+            "high": 1.0,
+        }
+        if lowered in mapping:
+            return mapping[lowered]
+
+    return _normalize_unit_score(value)
+
+
+def _extract_signal_values(raw_signals: Any) -> set[str]:
+    """
+    Normalize stored signals into a lowercase set of simple strings.
+
+    Supported shapes:
+    - ["future", "possibility"]
+    - "future, possibility"
+    - {"future": true, "possibility": true}
+    - {"tags": ["future", "possibility"]}
+    """
+    values = set()
+
+    if raw_signals is None:
+        return values
+
+    if isinstance(raw_signals, list):
+        for item in raw_signals:
+            if item is None:
+                continue
+            values.add(str(item).strip().lower())
+
+    elif isinstance(raw_signals, str):
+        normalized = raw_signals.replace("|", ",")
+        for part in normalized.split(","):
+            cleaned = part.strip().lower()
+            if cleaned:
+                values.add(cleaned)
+
+    elif isinstance(raw_signals, dict):
+        for key, value in raw_signals.items():
+            if isinstance(value, bool):
+                if value:
+                    values.add(str(key).strip().lower())
+            elif isinstance(value, list):
+                for item in value:
+                    if item is None:
+                        continue
+                    values.add(str(item).strip().lower())
+            elif value is not None:
+                values.add(str(value).strip().lower())
+
+    return {value for value in values if value}
+
+
+def _detect_query_signals(user_message: str, keywords: set[str]) -> set[str]:
+    """
+    Infer a very small set of deterministic query-side signals.
+
+    This is intentionally simple and bounded.
+    """
+    text = (user_message or "").lower()
+    query_signals = set()
+
+    future_terms = {
+        "plan", "plans", "planned", "planning", "next", "later",
+        "future", "upcoming", "soon", "tomorrow", "weekend", "month",
+        "eventually", "going", "might", "maybe"
+    }
+    preference_terms = {
+        "prefer", "preference", "like", "likes", "want", "wants",
+        "favorite", "favourite", "enjoy", "enjoys"
+    }
+    possibility_terms = {
+        "might", "maybe", "possible", "possibly", "perhaps",
+        "could", "may", "uncertain"
+    }
+
+    if any(term in text for term in future_terms) or (keywords & future_terms):
+        query_signals.add("future")
+
+    if any(term in text for term in preference_terms) or (keywords & preference_terms):
+        query_signals.add("preference")
+
+    if any(term in text for term in possibility_terms) or (keywords & possibility_terms):
+        query_signals.add("possibility")
+
+    return query_signals
+
+
+def _score_fact(fact: dict, keywords: set[str], query_signals: set[str]) -> dict[str, Any]:
+    """
+    Deterministic Phase 9 fact scoring.
+
+    Score components:
+    - text match in fact_text / subject / object / predicate / fact_type
+    - confidence bonus
+    - importance bonus
+    - small signal bonus
+    """
+    fact_text = fact.get("fact_text") or ""
+    fact_type = fact.get("fact_type") or ""
+    subject = fact.get("subject") or ""
+    predicate = fact.get("predicate") or ""
+    object_text = fact.get("object") or ""
+
+    metadata = fact.get("metadata") or {}
+    raw_signals = metadata.get("signals")
+    stored_signals = _extract_signal_values(raw_signals)
+
+    fact_text_matches = _count_keyword_matches(fact_text, keywords)
+    subject_matches = _count_keyword_matches(subject, keywords)
+    object_matches = _count_keyword_matches(object_text, keywords)
+    predicate_matches = _count_keyword_matches(predicate, keywords)
+    fact_type_matches = _count_keyword_matches(fact_type, keywords)
+
+    text_score = (
+        (fact_text_matches * 3.0)
+        + ((subject_matches + object_matches) * 2.0)
+        + (predicate_matches * 1.0)
+        + (fact_type_matches * 1.0)
+    )
+
+    confidence_score = _normalize_unit_score(fact.get("confidence")) * 2.0
+    importance_score = _normalize_importance_score(fact.get("importance")) * 2.0
+
+    matched_query_signals = query_signals & stored_signals
+    signal_score = min(len(matched_query_signals) * 0.5, 1.0)
+
+    total_score = text_score + confidence_score + importance_score + signal_score
+
+    return {
+        "fact": fact,
+        "score": total_score,
+        "text_score": text_score,
+        "confidence_score": confidence_score,
+        "importance_score": importance_score,
+        "signal_score": signal_score,
+        "keyword_matches": fact_text_matches + subject_matches + object_matches + predicate_matches + fact_type_matches,
+        "matched_query_signals": sorted(matched_query_signals),
+    }
+
+
+def _score_segment(
+    segment: dict,
+    keywords: set[str],
+    linked_fact_scores: list[float]
+) -> dict[str, Any]:
+    """
+    Deterministic Phase 9 segment scoring.
+
+    Score components:
+    - direct text match in topic / summary / raw excerpts
+    - strongest linked fact score
+    - small recency bonus
+    """
+    topic = segment.get("topic") or ""
+    summary = segment.get("summary") or ""
+    raw_user_text = segment.get("raw_user_text") or ""
+    raw_assistant_text = segment.get("raw_assistant_text") or ""
+
+    topic_matches = _count_keyword_matches(topic, keywords)
+    summary_matches = _count_keyword_matches(summary, keywords)
+    raw_user_matches = _count_keyword_matches(raw_user_text, keywords)
+    raw_assistant_matches = _count_keyword_matches(raw_assistant_text, keywords)
+
+    text_score = (
+        (topic_matches * 2.0)
+        + (summary_matches * 1.5)
+        + ((raw_user_matches + raw_assistant_matches) * 1.0)
+    )
+
+    max_linked_fact_score = max(linked_fact_scores) if linked_fact_scores else 0.0
+    recency_bonus = _safe_float(segment.get("segment_index"), default=0.0) * 0.01
+
+    total_score = text_score + max_linked_fact_score + recency_bonus
+
+    return {
+        "segment": segment,
+        "score": total_score,
+        "text_score": text_score,
+        "max_linked_fact_score": max_linked_fact_score,
+        "recency_bonus": recency_bonus,
+        "keyword_matches": topic_matches + summary_matches + raw_user_matches + raw_assistant_matches,
+    }
+
+
 def select_relevant_context(
     context_pack: Dict[str, Any],
     user_message: str,
@@ -178,11 +405,13 @@ def select_relevant_context(
     """
     Select a smaller, more relevant subset of the full context pack.
 
-    Tightened rules:
+    Phase 9 Step 1 rules:
     - keep conversation metadata unchanged
-    - prefer keyword matches strongly
-    - only use recency fallback when there are no matches
-    - for facts/memories, prefer direct matches, then links to selected items
+    - score facts first using keyword match + confidence + importance + signals
+    - score segments using direct text match + linked fact score + small recency bonus
+    - select top segments first, then top facts within those segments
+    - select memories linked to selected facts first, then selected segments
+    - only fall back to recency / original order when nothing matches meaningfully
     - keep output deterministic
     - return the same stable shape as build_context_pack()
     """
@@ -193,41 +422,78 @@ def select_relevant_context(
     memories = context_pack.get("memories") or []
 
     keywords = _extract_keywords(user_message)
+    query_signals = _detect_query_signals(user_message, keywords)
 
-    # ---- SEGMENTS ----
-    segments_recent_first = sorted(
-        segments,
-        key=lambda s: s.get("segment_index", 0),
+    facts_by_segment: dict[Any, list[dict]] = {}
+    memories_by_segment: dict[Any, list[dict]] = {}
+    memories_by_fact: dict[Any, list[dict]] = {}
+
+    for fact in facts:
+        segment_id = fact.get("segment_id")
+        facts_by_segment.setdefault(segment_id, []).append(fact)
+
+    for memory in memories:
+        segment_id = memory.get("segment_id")
+        fact_id = memory.get("fact_id")
+
+        memories_by_segment.setdefault(segment_id, []).append(memory)
+        memories_by_fact.setdefault(fact_id, []).append(memory)
+
+    # ---- FACT SCORING ----
+    scored_facts = []
+    fact_score_by_id: dict[Any, float] = {}
+
+    for fact in facts:
+        scored = _score_fact(fact, keywords, query_signals)
+        scored_facts.append(scored)
+
+        fact_id = fact.get("id")
+        if fact_id:
+            fact_score_by_id[fact_id] = scored["score"]
+
+    scored_facts.sort(
+        key=lambda item: (
+            item["score"],
+            item["keyword_matches"],
+            item["fact"].get("id", 0)
+        ),
         reverse=True
     )
 
-    matching_segments = []
-    nonmatching_segments = []
+    # ---- SEGMENT SCORING ----
+    scored_segments = []
 
-    for segment in segments_recent_first:
-        text_parts = [
-            segment.get("topic") or "",
-            segment.get("summary") or "",
-            segment.get("raw_user_text") or "",
-            segment.get("raw_assistant_text") or "",
-        ]
-        combined_text = " ".join(text_parts)
-        match_count = _count_keyword_matches(combined_text, keywords)
+    for segment in segments:
+        segment_id = segment.get("id")
+        linked_facts = facts_by_segment.get(segment_id, [])
+        linked_fact_scores = []
 
-        if match_count > 0:
-            matching_segments.append((match_count, segment.get("segment_index", 0), segment))
-        else:
-            nonmatching_segments.append((segment.get("segment_index", 0), segment))
+        for fact in linked_facts:
+            fact_id = fact.get("id")
+            linked_fact_scores.append(fact_score_by_id.get(fact_id, 0.0))
 
-    matching_segments.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    nonmatching_segments.sort(key=lambda item: item[0], reverse=True)
+        scored = _score_segment(segment, keywords, linked_fact_scores)
+        scored_segments.append(scored)
+
+    scored_segments.sort(
+        key=lambda item: (
+            item["score"],
+            item["keyword_matches"],
+            item["segment"].get("segment_index", 0)
+        ),
+        reverse=True
+    )
 
     selected_segments = []
     selected_segment_ids = set()
 
-    if matching_segments:
-        for _, _, segment in matching_segments:
+    has_meaningful_segment_match = any(item["score"] > 0 for item in scored_segments)
+
+    if has_meaningful_segment_match:
+        for item in scored_segments:
+            segment = item["segment"]
             segment_id = segment.get("id")
+
             if segment_id in selected_segment_ids:
                 continue
 
@@ -238,8 +504,15 @@ def select_relevant_context(
             if len(selected_segments) >= max_segments:
                 break
     else:
-        for _, segment in nonmatching_segments:
+        segments_recent_first = sorted(
+            segments,
+            key=lambda s: s.get("segment_index", 0),
+            reverse=True
+        )
+
+        for segment in segments_recent_first:
             segment_id = segment.get("id")
+
             if segment_id in selected_segment_ids:
                 continue
 
@@ -252,37 +525,27 @@ def select_relevant_context(
 
     selected_segments.sort(key=lambda s: s.get("segment_index", 0))
 
-    # ---- FACTS ----
-    matching_facts = []
-    linked_facts = []
-    fallback_facts = []
-
-    for fact in facts:
-        fact_text = fact.get("fact_text") or ""
-        fact_type = fact.get("fact_type") or ""
-        subject = fact.get("subject") or ""
-        predicate = fact.get("predicate") or ""
-        object_text = fact.get("object") or ""
-
-        combined_text = " ".join([fact_text, fact_type, subject, predicate, object_text])
-        match_count = _count_keyword_matches(combined_text, keywords)
-        segment_id = fact.get("segment_id")
-
-        if match_count > 0:
-            matching_facts.append((match_count, fact))
-        elif segment_id in selected_segment_ids:
-            linked_facts.append(fact)
-        else:
-            fallback_facts.append(fact)
-
-    matching_facts.sort(key=lambda item: item[0], reverse=True)
-
+    # ---- FACT SELECTION ----
     selected_facts = []
     selected_fact_ids = set()
 
-    if matching_facts:
-        for _, fact in matching_facts:
+    scored_facts_in_selected_segments = []
+    scored_facts_outside_selected_segments = []
+
+    for item in scored_facts:
+        fact = item["fact"]
+        if fact.get("segment_id") in selected_segment_ids:
+            scored_facts_in_selected_segments.append(item)
+        else:
+            scored_facts_outside_selected_segments.append(item)
+
+    has_meaningful_fact_match = any(item["score"] > 0 for item in scored_facts)
+
+    if has_meaningful_fact_match:
+        for item in scored_facts_in_selected_segments:
+            fact = item["fact"]
             fact_id = fact.get("id")
+
             if fact_id in selected_fact_ids:
                 continue
 
@@ -294,33 +557,29 @@ def select_relevant_context(
                 break
 
         if len(selected_facts) < max_facts:
-            for fact in linked_facts:
+            for item in scored_facts_outside_selected_segments:
+                fact = item["fact"]
                 fact_id = fact.get("id")
+
                 if fact_id in selected_fact_ids:
                     continue
 
-                    # unreachable in practice but harmless structurally
                 selected_facts.append(fact)
                 if fact_id:
                     selected_fact_ids.add(fact_id)
 
                 if len(selected_facts) >= max_facts:
                     break
-    elif linked_facts:
+    else:
+        linked_facts = []
+
+        for segment in selected_segments:
+            segment_id = segment.get("id")
+            linked_facts.extend(facts_by_segment.get(segment_id, []))
+
         for fact in linked_facts:
             fact_id = fact.get("id")
-            if fact_id in selected_fact_ids:
-                continue
 
-            selected_facts.append(fact)
-            if fact_id:
-                selected_fact_ids.add(fact_id)
-
-            if len(selected_facts) >= max_facts:
-                break
-    else:
-        for fact in fallback_facts:
-            fact_id = fact.get("id")
             if fact_id in selected_fact_ids:
                 continue
 
@@ -331,39 +590,60 @@ def select_relevant_context(
             if len(selected_facts) >= max_facts:
                 break
 
-    # ---- MEMORIES ----
-    matching_memories = []
-    linked_memories = []
-    fallback_memories = []
+        if len(selected_facts) < max_facts:
+            for fact in facts:
+                fact_id = fact.get("id")
 
-    for memory in memories:
-        content = memory.get("content") or ""
-        memory_kind = memory.get("memory_kind") or ""
-        status = memory.get("status") or ""
+                if fact_id in selected_fact_ids:
+                    continue
 
-        combined_text = " ".join([content, memory_kind, status])
-        match_count = _count_keyword_matches(combined_text, keywords)
+                selected_facts.append(fact)
+                if fact_id:
+                    selected_fact_ids.add(fact_id)
 
-        segment_id = memory.get("segment_id")
-        fact_id = memory.get("fact_id")
+                if len(selected_facts) >= max_facts:
+                    break
 
-        is_linked = (segment_id in selected_segment_ids) or (fact_id in selected_fact_ids)
-
-        if match_count > 0:
-            matching_memories.append((match_count, memory))
-        elif is_linked:
-            linked_memories.append(memory)
-        else:
-            fallback_memories.append(memory)
-
-    matching_memories.sort(key=lambda item: item[0], reverse=True)
-
+    # ---- MEMORY SELECTION ----
     selected_memories = []
     selected_memory_ids = set()
 
-    if matching_memories:
-        for _, memory in matching_memories:
+    linked_to_selected_facts = []
+    linked_to_selected_segments = []
+    unlinked_fallback = []
+
+    for memory in memories:
+        memory_id = memory.get("id")
+        fact_id = memory.get("fact_id")
+        segment_id = memory.get("segment_id")
+
+        if memory_id in selected_memory_ids:
+            continue
+
+        if fact_id in selected_fact_ids:
+            linked_to_selected_facts.append(memory)
+        elif segment_id in selected_segment_ids:
+            linked_to_selected_segments.append(memory)
+        else:
+            unlinked_fallback.append(memory)
+
+    for memory in linked_to_selected_facts:
+        memory_id = memory.get("id")
+
+        if memory_id in selected_memory_ids:
+            continue
+
+        selected_memories.append(memory)
+        if memory_id:
+            selected_memory_ids.add(memory_id)
+
+        if len(selected_memories) >= max_memories:
+            break
+
+    if len(selected_memories) < max_memories:
+        for memory in linked_to_selected_segments:
             memory_id = memory.get("id")
+
             if memory_id in selected_memory_ids:
                 continue
 
@@ -374,33 +654,10 @@ def select_relevant_context(
             if len(selected_memories) >= max_memories:
                 break
 
-        if len(selected_memories) < max_memories:
-            for memory in linked_memories:
-                memory_id = memory.get("id")
-                if memory_id in selected_memory_ids:
-                    continue
-
-                selected_memories.append(memory)
-                if memory_id:
-                    selected_memory_ids.add(memory_id)
-
-                if len(selected_memories) >= max_memories:
-                    break
-    elif linked_memories:
-        for memory in linked_memories:
+    if len(selected_memories) < max_memories:
+        for memory in unlinked_fallback:
             memory_id = memory.get("id")
-            if memory_id in selected_memory_ids:
-                continue
 
-            selected_memories.append(memory)
-            if memory_id:
-                selected_memory_ids.add(memory_id)
-
-            if len(selected_memories) >= max_memories:
-                break
-    else:
-        for memory in fallback_memories:
-            memory_id = memory.get("id")
             if memory_id in selected_memory_ids:
                 continue
 
