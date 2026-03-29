@@ -1770,12 +1770,13 @@ def agent_global_context(input_data: MessageInput):
 def companion(input_data: CompanionInput):
     try:
         user_message = input_data.message.strip()
+        client_conversation_id = input_data.conversation_id
 
-        conversation_id, conversation_created = resolve_or_create_conversation(input_data.conversation_id)
+        conversation_id, conversation_created = resolve_or_create_conversation(client_conversation_id)
 
         decision = route_message_decision(
             message=user_message,
-            conversation_id=conversation_id
+            conversation_id=client_conversation_id
         )
 
         route = decision["route"]
