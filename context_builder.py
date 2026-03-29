@@ -291,6 +291,7 @@ def _detect_query_signals(user_message: str, keywords: set[str]) -> set[str]:
 
     if any(term in text for term in preference_terms) or (keywords & preference_terms):
         query_signals.add("preference")
+        query_signals.add("type:preference")
 
     if any(term in text for term in possibility_terms) or (keywords & possibility_terms):
         query_signals.add("possibility")
@@ -314,7 +315,10 @@ def _score_fact(fact: dict, keywords: set[str], query_signals: set[str]) -> dict
     predicate = fact.get("predicate") or ""
     object_text = fact.get("object") or ""
 
-    metadata = fact.get("metadata") or {}
+    metadata = fact.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
     raw_signals = metadata.get("signals")
     stored_signals = _extract_signal_values(raw_signals)
 
@@ -332,7 +336,12 @@ def _score_fact(fact: dict, keywords: set[str], query_signals: set[str]) -> dict
     )
 
     confidence_score = _normalize_unit_score(fact.get("confidence")) * 2.0
-    importance_score = _normalize_importance_score(fact.get("importance")) * 2.0
+
+    importance_value = fact.get("importance")
+    if importance_value is None:
+        importance_value = metadata.get("importance")
+
+    importance_score = _normalize_importance_score(importance_value) * 2.0
 
     matched_query_signals = query_signals & stored_signals
     signal_score = min(len(matched_query_signals) * 0.5, 1.0)
