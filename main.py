@@ -411,11 +411,6 @@ ALLOWED_ROUTES = {
     "normal_chat",
 }
 
-AUTO_CAPTURE_ROUTES = {
-    "task",
-    "normal_chat",
-}
-
 
 def run_add_task(args: dict):
     validated = AddTaskArgs(**args)
@@ -483,6 +478,31 @@ def fetch_conversation_or_404(conversation_id: str):
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
     return rows[0]
+
+
+def create_conversation_record(session_name: str | None = None, metadata: dict | None = None) -> dict:
+    result = supabase.table("conversations").insert({
+        "session_name": session_name,
+        "metadata": metadata or {}
+    }).execute()
+
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=500, detail="Failed to create conversation.")
+
+    return rows[0]
+
+
+def resolve_or_create_conversation(conversation_id: str | None) -> tuple[str, bool]:
+    if conversation_id:
+        fetch_conversation_or_404(conversation_id)
+        return conversation_id, False
+
+    conversation = create_conversation_record(
+        session_name=None,
+        metadata={"source": "companion_auto_create"}
+    )
+    return conversation["id"], True
 
 
 def normalize_message_for_routing(message: str) -> str:
@@ -919,10 +939,6 @@ def get_next_segment_index(conversation_id: str) -> int:
     return int(rows[0]["segment_index"]) + 1
 
 
-def should_auto_capture_memory(route: str) -> bool:
-    return route in AUTO_CAPTURE_ROUTES
-
-
 def extract_memory_capture(
     user_message: str,
     assistant_reply: str,
@@ -1006,27 +1022,47 @@ def extract_memory_capture(
     )
 
 
-def auto_capture_exchange_memory(
-    conversation_id: str | None,
+def save_turn_segment(
+    conversation_id: str,
     user_message: str,
     assistant_reply: str,
     route: str,
     decision_source: str
 ) -> dict:
-    if not should_auto_capture_memory(route):
-        return {
-            "status": "skipped",
-            "reason": f"Route '{route}' is not eligible for auto memory capture"
+    segment_index = get_next_segment_index(conversation_id)
+
+    segment_payload = {
+        "conversation_id": conversation_id,
+        "segment_index": segment_index,
+        "topic": None,
+        "summary": None,
+        "raw_user_text": user_message,
+        "raw_assistant_text": assistant_reply,
+        "metadata": {
+            "source": "companion_turn",
+            "route": route,
+            "decision_source": decision_source,
+            "extraction_status": "pending",
+            "extraction_error": None,
         }
+    }
 
-    if not conversation_id:
-        return {
-            "status": "skipped",
-            "reason": "No conversation_id was provided"
-        }
+    segment_result = supabase.table("conversation_segments").insert(segment_payload).execute()
+    rows = segment_result.data or []
+    if not rows:
+        raise HTTPException(status_code=500, detail="Failed to store segment.")
 
-    fetch_conversation_or_404(conversation_id)
+    return rows[0]
 
+
+def extract_and_store_turn_memory(
+    conversation_id: str,
+    segment_id: str,
+    route: str,
+    decision_source: str,
+    user_message: str,
+    assistant_reply: str
+) -> dict:
     extraction = None
     extraction_error = None
 
@@ -1038,19 +1074,11 @@ def auto_capture_exchange_memory(
         )
     except Exception as e:
         extraction_error = str(e)
-        logger.exception("Memory extraction failed; continuing with bare segment storage")
+        logger.exception("Memory extraction failed after segment creation")
 
-    segment_index = get_next_segment_index(conversation_id)
-
-    segment_payload = {
-        "conversation_id": conversation_id,
-        "segment_index": segment_index,
-        "topic": extraction.topic if extraction else None,
-        "summary": extraction.summary if extraction else None,
-        "raw_user_text": user_message,
-        "raw_assistant_text": assistant_reply,
+    update_payload = {
         "metadata": {
-            "source": "auto_capture",
+            "source": "companion_turn",
             "route": route,
             "decision_source": decision_source,
             "extraction_status": "ok" if extraction else "failed",
@@ -1058,9 +1086,16 @@ def auto_capture_exchange_memory(
         }
     }
 
-    segment_result = supabase.table("conversation_segments").insert(segment_payload).execute()
-    segment = segment_result.data[0]
-    segment_id = segment["id"]
+    if extraction:
+        update_payload["topic"] = extraction.topic
+        update_payload["summary"] = extraction.summary
+
+    (
+        supabase.table("conversation_segments")
+        .update(update_payload)
+        .eq("id", segment_id)
+        .execute()
+    )
 
     facts_created = 0
     memories_created = 0
@@ -1080,17 +1115,21 @@ def auto_capture_exchange_memory(
             "predicate": enriched_fact.predicate,
             "object": enriched_fact.object,
             "metadata": {
-                "source": "auto_capture",
+                "source": "companion_turn",
                 "route": route,
                 "importance": enrichment_metadata["importance"],
                 "signals": enrichment_metadata["signals"],
             }
         }).execute()
 
-        fact_row = fact_result.data[0]
+        fact_rows = fact_result.data or []
+        if not fact_rows:
+            raise HTTPException(status_code=500, detail="Failed to store fact.")
+
+        fact_row = fact_rows[0]
         facts_created += 1
 
-        supabase.table("memories").insert({
+        memory_result = supabase.table("memories").insert({
             "conversation_id": conversation_id,
             "segment_id": segment_id,
             "fact_id": fact_row["id"],
@@ -1098,23 +1137,27 @@ def auto_capture_exchange_memory(
             "content": enriched_fact.fact_text,
             "status": "active",
             "metadata": {
-                "source": "auto_capture",
+                "source": "companion_turn",
                 "route": route,
                 "importance": enrichment_metadata["importance"],
             }
         }).execute()
 
+        memory_rows = memory_result.data or []
+        if not memory_rows:
+            raise HTTPException(status_code=500, detail="Failed to store memory.")
+
         memories_created += 1
 
     return {
-        "status": "stored",
-        "reason": "Auto memory capture completed",
-        "segment_id": segment_id,
-        "segment_index": segment_index,
+        "status": "stored" if extraction else "partial",
+        "reason": "Segment stored and memory extraction completed" if extraction else "Segment stored but memory extraction failed",
         "facts_created": facts_created,
         "memories_created": memories_created,
         "extraction_status": "ok" if extraction else "failed",
         "extraction_error": extraction_error,
+        "topic": extraction.topic if extraction else None,
+        "summary": extraction.summary if extraction else None,
     }
 
 
@@ -1727,7 +1770,8 @@ def agent_global_context(input_data: MessageInput):
 def companion(input_data: CompanionInput):
     try:
         user_message = input_data.message.strip()
-        conversation_id = input_data.conversation_id
+
+        conversation_id, conversation_created = resolve_or_create_conversation(input_data.conversation_id)
 
         decision = route_message_decision(
             message=user_message,
@@ -1738,82 +1782,56 @@ def companion(input_data: CompanionInput):
         reason = decision["reason"]
         decision_source = decision["decision_source"]
 
+        result = None
+
         if route == "task":
             result = run_task_agent_flow(user_message)
 
-            memory_capture = auto_capture_exchange_memory(
-                conversation_id=conversation_id,
-                user_message=user_message,
-                assistant_reply=result["reply"],
-                route=route,
-                decision_source=decision_source
-            )
-
-            return {
-                "route_used": route,
-                "reason": reason,
-                "decision_source": decision_source,
-                "reply": result["reply"],
-                "memory_capture": memory_capture
-            }
-
-        if route == "conversation_memory":
-            if not conversation_id:
-                return {
-                    "route_used": route,
-                    "reason": "Conversation memory route selected but no conversation_id was provided",
-                    "decision_source": decision_source,
-                    "reply": "A conversation_id is required for current-conversation memory.",
-                    "memory_capture": {
-                        "status": "skipped",
-                        "reason": "Route 'conversation_memory' is not eligible for auto memory capture"
-                    }
-                }
-
+        elif route == "conversation_memory":
             result = run_conversation_memory_flow(user_message, conversation_id)
-            return {
-                "route_used": route,
-                "reason": reason,
-                "decision_source": decision_source,
-                "reply": result["reply"],
-                "context_used": result["context_used"],
-                "memory_capture": {
-                    "status": "skipped",
-                    "reason": "Route 'conversation_memory' is not eligible for auto memory capture"
-                }
-            }
 
-        if route == "global_memory":
+        elif route == "global_memory":
             result = run_global_memory_flow(user_message)
-            return {
-                "route_used": route,
-                "reason": reason,
-                "decision_source": decision_source,
-                "reply": result["reply"],
-                "context_used": result["context_used"],
-                "memory_capture": {
-                    "status": "skipped",
-                    "reason": "Route 'global_memory' is not eligible for auto memory capture"
-                }
-            }
 
-        result = run_normal_chat_flow(user_message)
+        else:
+            result = run_normal_chat_flow(user_message)
 
-        memory_capture = auto_capture_exchange_memory(
+        assistant_reply = result["reply"]
+
+        segment = save_turn_segment(
             conversation_id=conversation_id,
             user_message=user_message,
-            assistant_reply=result["reply"],
+            assistant_reply=assistant_reply,
             route=route,
             decision_source=decision_source
         )
 
-        return {
+        memory_capture = extract_and_store_turn_memory(
+            conversation_id=conversation_id,
+            segment_id=segment["id"],
+            route=route,
+            decision_source=decision_source,
+            user_message=user_message,
+            assistant_reply=assistant_reply
+        )
+
+        response_payload = {
+            "conversation_id": conversation_id,
+            "conversation_created": conversation_created,
             "route_used": route,
             "reason": reason,
             "decision_source": decision_source,
-            "reply": result["reply"],
-            "memory_capture": memory_capture
+            "assistant_reply": assistant_reply,
+            "reply": assistant_reply,
+            "segment_id": segment["id"],
+            "segment_index": segment["segment_index"],
+            "memory_capture": memory_capture,
         }
+
+        if "context_used" in result:
+            response_payload["context_used"] = result["context_used"]
+
+        return response_payload
 
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
