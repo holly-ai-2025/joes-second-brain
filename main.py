@@ -658,6 +658,25 @@ def enrich_fact_candidate(fact: FactCandidate) -> tuple[FactCandidate, dict]:
     return enriched_fact, metadata
 
 
+def normalize_fact_text_for_dedupe(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def dedupe_fact_candidates(facts: list[FactCandidate]) -> list[FactCandidate]:
+    deduped = []
+    seen = set()
+
+    for fact in facts:
+        key = normalize_fact_text_for_dedupe(fact.fact_text)
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(fact)
+
+    return deduped
+
+
 def is_high_confidence_task_query(text: str) -> bool:
     task_create_phrases = [
         "add a task",
@@ -911,14 +930,14 @@ def extract_memory_capture(
 ) -> MemoryCaptureOutput:
     system_prompt = (
         "You are a strict structured-memory extraction helper for an AI companion backend. "
-        "Your job is to extract conservative, durable memory candidates from a single user-assistant exchange. "
+        "Your job is to extract conservative but useful memory candidates from a single user-assistant exchange. "
         "Return JSON only with keys: topic, summary, facts. "
         "facts must be a list of objects with keys: fact_text, fact_type, confidence, subject, predicate, object. "
         "Use fact_type conservatively from this preferred set when possible: plan, possibility, preference, decision, status, relationship, fact. "
         "Do not include markdown or any extra text. "
-        "Be conservative. "
         "Only extract facts that are grounded in the user's message, not invented by the assistant. "
-        "Prefer durable or meaningful information such as preferences, plans, relationships, project details, persistent circumstances, or notable user-provided facts. "
+        "If the user's message contains multiple distinct meaningful facts, extract multiple separate facts rather than collapsing them into one. "
+        "Prefer durable or useful information such as preferences, plans, possibilities, decisions, relationships, project details, named people and their roles, collaborator availability, responsibilities, tool or app intentions, and notable user-provided facts. "
         "Do not store generic chit-chat, assistant advice, filler, or very temporary emotions. "
         "If the route is task, do not store the task itself unless the user message also contains a meaningful non-task fact worth remembering. "
         "You may return zero facts. "
@@ -959,7 +978,7 @@ def extract_memory_capture(
     validated = MemoryCaptureOutput(**parsed)
 
     trimmed_facts = []
-    for fact in validated.facts[:3]:
+    for fact in validated.facts[:6]:
         clean_fact_text = fact.fact_text.strip()
         if not clean_fact_text:
             continue
@@ -975,6 +994,8 @@ def extract_memory_capture(
 
         enriched_fact, _ = enrich_fact_candidate(preliminary_fact)
         trimmed_facts.append(enriched_fact)
+
+    trimmed_facts = dedupe_fact_candidates(trimmed_facts)
 
     return MemoryCaptureOutput(
         topic=validated.topic.strip() if validated.topic else None,
