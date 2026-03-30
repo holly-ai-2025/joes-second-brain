@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import time
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ValidationError, Field
 from dotenv import load_dotenv
@@ -207,6 +208,36 @@ PRONOUN_LIKE_NAMES = {
     "The",
 }
 
+QUICK_CAPTURE_PREFIXES = [
+    "remember that ",
+    "note that ",
+    "quick note: ",
+    "quick note ",
+    "note to self: ",
+    "note to self ",
+    "idea: ",
+    "idea ",
+    "thought: ",
+    "thought ",
+    "capture: ",
+    "capture ",
+    "log this: ",
+    "log this ",
+    "for the record ",
+]
+
+QUICK_CAPTURE_STARTERS = [
+    "remember that",
+    "note that",
+    "quick note",
+    "note to self",
+    "idea",
+    "thought",
+    "capture",
+    "log this",
+    "for the record",
+]
+
 
 class MessageInput(BaseModel):
     message: str = Field(..., min_length=1)
@@ -406,6 +437,7 @@ TOOLS = [
 
 ALLOWED_ROUTES = {
     "task",
+    "quick_capture",
     "conversation_memory",
     "global_memory",
     "normal_chat",
@@ -741,6 +773,24 @@ def is_high_confidence_task_query(text: str) -> bool:
     return contains_any_phrase(text, task_create_phrases + task_list_phrases)
 
 
+def is_high_confidence_quick_capture(text: str) -> bool:
+    if starts_with_any_phrase(text, QUICK_CAPTURE_STARTERS):
+        return True
+
+    capture_patterns = [
+        "remember that ",
+        "note that ",
+        "quick note: ",
+        "note to self: ",
+        "idea: ",
+        "thought: ",
+        "capture: ",
+        "log this: ",
+    ]
+
+    return starts_with_any_phrase(text, capture_patterns)
+
+
 def get_high_confidence_memory_route(
     text: str,
     conversation_id: str | None = None
@@ -890,6 +940,14 @@ def route_message_decision(message: str, conversation_id: str | None = None) -> 
             "decision_source": "rule"
         }
 
+    if is_high_confidence_quick_capture(text):
+        logger.info("Routing decision: quick_capture | source=rule | message=%s", text)
+        return {
+            "route": "quick_capture",
+            "reason": "Matched high-confidence quick capture phrase",
+            "decision_source": "rule"
+        }
+
     memory_rule_result = get_high_confidence_memory_route(
         text=text,
         conversation_id=conversation_id
@@ -1027,24 +1085,33 @@ def save_turn_segment(
     user_message: str,
     assistant_reply: str,
     route: str,
-    decision_source: str
+    decision_source: str,
+    topic: str | None = None,
+    summary: str | None = None,
+    extraction_status: str = "pending",
+    extraction_error: str | None = None,
+    metadata_extra: dict | None = None,
 ) -> dict:
     segment_index = get_next_segment_index(conversation_id)
+
+    metadata = {
+        "source": "companion_turn",
+        "route": route,
+        "decision_source": decision_source,
+        "extraction_status": extraction_status,
+        "extraction_error": extraction_error,
+    }
+    if metadata_extra:
+        metadata.update(metadata_extra)
 
     segment_payload = {
         "conversation_id": conversation_id,
         "segment_index": segment_index,
-        "topic": None,
-        "summary": None,
+        "topic": topic,
+        "summary": summary,
         "raw_user_text": user_message,
         "raw_assistant_text": assistant_reply,
-        "metadata": {
-            "source": "companion_turn",
-            "route": route,
-            "decision_source": decision_source,
-            "extraction_status": "pending",
-            "extraction_error": None,
-        }
+        "metadata": metadata,
     }
 
     segment_result = supabase.table("conversation_segments").insert(segment_payload).execute()
@@ -1158,6 +1225,203 @@ def extract_and_store_turn_memory(
         "extraction_error": extraction_error,
         "topic": extraction.topic if extraction else None,
         "summary": extraction.summary if extraction else None,
+    }
+
+
+def normalize_text_sentence(text: str) -> str:
+    clean = " ".join((text or "").strip().split())
+    if not clean:
+        return clean
+    if clean[-1] not in ".!?":
+        clean += "."
+    return clean
+
+
+def parse_direct_task_action(user_message: str) -> dict:
+    text = normalize_message_for_routing(user_message)
+
+    list_phrases = [
+        "list tasks",
+        "show tasks",
+        "show my tasks",
+        "list my tasks",
+        "my tasks",
+        "what are my tasks",
+        "what tasks do i have",
+        "do i have any tasks",
+        "do i have tasks",
+        "what is on my task list",
+        "what's on my task list",
+        "show me my task list",
+        "show me my tasks",
+        "what is on my list",
+        "what's on my list",
+        "what do i have on my list",
+        "what do i have on my task list",
+    ]
+
+    if contains_any_phrase(text, list_phrases):
+        return {"action": "list"}
+
+    add_patterns = [
+        r"^add a task to (.+)$",
+        r"^add task (.+)$",
+        r"^add a task (.+)$",
+        r"^create a task (.+)$",
+        r"^create task (.+)$",
+        r"^new task[: ]+(.+)$",
+        r"^can you add a task (.+)$",
+        r"^can you create a task (.+)$",
+    ]
+
+    for pattern in add_patterns:
+        match = re.match(pattern, text)
+        if match:
+            title = match.group(1).strip(" .")
+            if title:
+                return {"action": "add", "title": title}
+
+    if "add a task" in text or "create a task" in text or text == "new task":
+        return {"action": "add_missing_title"}
+
+    return {"action": "unknown"}
+
+
+def run_task_flow_fast(user_message: str) -> dict:
+    parsed = parse_direct_task_action(user_message)
+
+    if parsed["action"] == "list":
+        result = run_list_tasks({})
+        tasks = result["data"]
+
+        if not tasks:
+            reply = "You have no open tasks."
+        else:
+            task_lines = [f"{task['id']}. {task['title']}" for task in tasks[:15]]
+            reply = "Your tasks:\n" + "\n".join(task_lines)
+
+        return {"reply": reply}
+
+    if parsed["action"] == "add":
+        result = run_add_task({"title": parsed["title"]})
+        reply = result["message"]
+        return {"reply": reply}
+
+    if parsed["action"] == "add_missing_title":
+        return {"reply": "Please include a task title."}
+
+    return {"reply": "This prototype only supports adding and listing tasks."}
+
+
+def extract_quick_capture_fact(user_message: str) -> FactCandidate:
+    original = " ".join(user_message.strip().split())
+    lowered = original.lower()
+
+    content = original
+    for prefix in QUICK_CAPTURE_PREFIXES:
+        if lowered.startswith(prefix):
+            content = original[len(prefix):].strip()
+            break
+
+    if not content:
+        content = original
+
+    content = normalize_text_sentence(content)
+
+    lowered_content = normalize_message_for_routing(content)
+
+    subject = None
+    predicate = None
+    object_value = None
+
+    if lowered_content.startswith("i prefer "):
+        subject = "user"
+        predicate = "prefers"
+        object_value = content[9:].strip(" .")
+    elif lowered_content.startswith("i like "):
+        subject = "user"
+        predicate = "likes"
+        object_value = content[7:].strip(" .")
+    elif lowered_content.startswith("i want "):
+        subject = "user"
+        predicate = "wants"
+        object_value = content[7:].strip(" .")
+    elif lowered_content.startswith("i'm ") or lowered_content.startswith("i am "):
+        subject = "user"
+        predicate = "status"
+        object_value = content
+
+    fact_type = normalize_fact_type(None, content)
+    confidence = score_confidence_for_fact(content, fact_type, None)
+
+    return FactCandidate(
+        fact_text=content,
+        fact_type=fact_type,
+        confidence=confidence,
+        subject=subject,
+        predicate=predicate,
+        object=object_value,
+    )
+
+
+def store_quick_capture_memory(
+    conversation_id: str,
+    segment_id: str,
+    route: str,
+    fact: FactCandidate
+) -> dict:
+    enriched_fact, enrichment_metadata = enrich_fact_candidate(fact)
+
+    fact_result = supabase.table("memory_facts").insert({
+        "conversation_id": conversation_id,
+        "segment_id": segment_id,
+        "fact_text": enriched_fact.fact_text,
+        "fact_type": enriched_fact.fact_type or "fact",
+        "confidence": enriched_fact.confidence,
+        "subject": enriched_fact.subject,
+        "predicate": enriched_fact.predicate,
+        "object": enriched_fact.object,
+        "metadata": {
+            "source": "companion_turn",
+            "route": route,
+            "importance": enrichment_metadata["importance"],
+            "signals": enrichment_metadata["signals"],
+        }
+    }).execute()
+
+    fact_rows = fact_result.data or []
+    if not fact_rows:
+        raise HTTPException(status_code=500, detail="Failed to store fact.")
+
+    fact_row = fact_rows[0]
+
+    memory_result = supabase.table("memories").insert({
+        "conversation_id": conversation_id,
+        "segment_id": segment_id,
+        "fact_id": fact_row["id"],
+        "memory_kind": "semantic_scaffold",
+        "content": enriched_fact.fact_text,
+        "status": "active",
+        "metadata": {
+            "source": "companion_turn",
+            "route": route,
+            "importance": enrichment_metadata["importance"],
+        }
+    }).execute()
+
+    memory_rows = memory_result.data or []
+    if not memory_rows:
+        raise HTTPException(status_code=500, detail="Failed to store memory.")
+
+    return {
+        "status": "stored",
+        "reason": "Quick capture stored directly",
+        "facts_created": 1,
+        "memories_created": 1,
+        "extraction_status": "direct",
+        "extraction_error": None,
+        "topic": "Quick capture",
+        "summary": enriched_fact.fact_text,
     }
 
 
@@ -1769,24 +2033,51 @@ def agent_global_context(input_data: MessageInput):
 @app.post("/companion")
 def companion(input_data: CompanionInput):
     try:
+        total_start = time.perf_counter()
+        timings = {}
+
         user_message = input_data.message.strip()
         client_conversation_id = input_data.conversation_id
 
+        t0 = time.perf_counter()
         conversation_id, conversation_created = resolve_or_create_conversation(client_conversation_id)
+        timings["conversation_resolution_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
+        t0 = time.perf_counter()
         decision = route_message_decision(
             message=user_message,
             conversation_id=client_conversation_id
         )
+        timings["routing_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         route = decision["route"]
         reason = decision["reason"]
         decision_source = decision["decision_source"]
 
         result = None
+        direct_memory_capture = None
+        segment_topic = None
+        segment_summary = None
+        extraction_status = "pending"
+        metadata_extra = {}
+
+        t0 = time.perf_counter()
 
         if route == "task":
-            result = run_task_agent_flow(user_message)
+            result = run_task_flow_fast(user_message)
+            segment_topic = "Task interaction"
+            segment_summary = "User interacted with the task system."
+            extraction_status = "skipped"
+            metadata_extra["memory_capture_mode"] = "skipped_for_task"
+
+        elif route == "quick_capture":
+            result = {"reply": "Got it - saved."}
+            fact = extract_quick_capture_fact(user_message)
+            segment_topic = "Quick capture"
+            segment_summary = fact.fact_text
+            extraction_status = "direct"
+            metadata_extra["memory_capture_mode"] = "direct_quick_capture"
+            metadata_extra["quick_capture_fact_type"] = fact.fact_type
 
         elif route == "conversation_memory":
             result = run_conversation_memory_flow(user_message, conversation_id)
@@ -1797,23 +2088,65 @@ def companion(input_data: CompanionInput):
         else:
             result = run_normal_chat_flow(user_message)
 
+        timings["flow_execution_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
         assistant_reply = result["reply"]
 
+        t0 = time.perf_counter()
         segment = save_turn_segment(
             conversation_id=conversation_id,
             user_message=user_message,
             assistant_reply=assistant_reply,
             route=route,
-            decision_source=decision_source
-        )
-
-        memory_capture = extract_and_store_turn_memory(
-            conversation_id=conversation_id,
-            segment_id=segment["id"],
-            route=route,
             decision_source=decision_source,
-            user_message=user_message,
-            assistant_reply=assistant_reply
+            topic=segment_topic,
+            summary=segment_summary,
+            extraction_status=extraction_status,
+            metadata_extra=metadata_extra,
+        )
+        timings["segment_save_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        t0 = time.perf_counter()
+
+        if route == "quick_capture":
+            fact = extract_quick_capture_fact(user_message)
+            direct_memory_capture = store_quick_capture_memory(
+                conversation_id=conversation_id,
+                segment_id=segment["id"],
+                route=route,
+                fact=fact
+            )
+            memory_capture = direct_memory_capture
+
+        elif route == "task":
+            memory_capture = {
+                "status": "skipped",
+                "reason": "Memory extraction skipped for task route",
+                "facts_created": 0,
+                "memories_created": 0,
+                "extraction_status": "skipped",
+                "extraction_error": None,
+                "topic": segment_topic,
+                "summary": segment_summary,
+            }
+
+        else:
+            memory_capture = extract_and_store_turn_memory(
+                conversation_id=conversation_id,
+                segment_id=segment["id"],
+                route=route,
+                decision_source=decision_source,
+                user_message=user_message,
+                assistant_reply=assistant_reply
+            )
+
+        timings["memory_capture_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        timings["total_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
+
+        logger.info(
+            "Companion timings | route=%s | timings=%s",
+            route,
+            timings
         )
 
         response_payload = {
@@ -1827,6 +2160,7 @@ def companion(input_data: CompanionInput):
             "segment_id": segment["id"],
             "segment_index": segment["segment_index"],
             "memory_capture": memory_capture,
+            "timings_ms": timings,
         }
 
         if "context_used" in result:
